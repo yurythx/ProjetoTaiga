@@ -1,0 +1,337 @@
+version: "3.9"
+
+# =============================================================================
+#  TAIGA — Docker Compose (Modo Local / Sem Proxy Reverso)
+#
+#  Neste modo, cada serviço expõe sua própria porta diretamente ao host.
+#  Acesso via IP da máquina, sem Nginx gateway.
+#
+#  Portas expostas ao host:
+#    9000  → taiga-front   (Interface Web Angular)
+#    8000  → taiga-back    (API REST Django)
+#    8888  → taiga-events  (WebSocket — notificações em tempo real)
+#    8003  → taiga-protected (Arquivos privados)
+#
+#  Antes de subir:
+#    1. cp .env.example .env
+#    2. Edite TAIGA_DOMAIN com o IP da sua máquina (ex: 192.168.1.10)
+#    3. docker compose up -d
+# =============================================================================
+
+
+# ---------------------------------------------------------------------------
+# BLOCO DE VARIÁVEIS compartilhado entre taiga-back e taiga-async.
+# Todas as variáveis são lidas do arquivo .env na raiz do projeto.
+# ---------------------------------------------------------------------------
+x-environment: &default-back-environment
+
+  # Conexão com o banco de dados PostgreSQL
+  POSTGRES_DB: "${POSTGRES_DB}"
+  POSTGRES_USER: "${POSTGRES_USER}"
+  POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+  POSTGRES_HOST: taiga-db
+
+  # Identidade pública do Taiga (IP ou domínio configurado no .env)
+  TAIGA_SECRET_KEY: "${SECRET_KEY}"
+  TAIGA_SITES_SCHEME: "${TAIGA_SCHEME}"
+  TAIGA_SITES_DOMAIN: "${TAIGA_DOMAIN}"
+  TAIGA_SUBPATH: ""
+
+  # E-mail: em modo local o backend "console" imprime as mensagens nos logs.
+  # Não é necessário configurar um servidor SMTP para testes locais.
+  EMAIL_BACKEND: "${EMAIL_BACKEND:-django.core.mail.backends.console.EmailBackend}"
+  DEFAULT_FROM_EMAIL: "${DEFAULT_FROM_EMAIL:-taiga@localhost}"
+  EMAIL_HOST: "${EMAIL_HOST:-localhost}"
+  EMAIL_PORT: "${EMAIL_PORT:-587}"
+  EMAIL_HOST_USER: "${EMAIL_HOST_USER}"
+  EMAIL_HOST_PASSWORD: "${EMAIL_HOST_PASSWORD}"
+  EMAIL_USE_TLS: "${EMAIL_USE_TLS:-False}"
+  EMAIL_USE_SSL: "${EMAIL_USE_SSL:-False}"
+
+  # RabbitMQ — broker de mensagens para tarefas assíncronas
+  RABBITMQ_USER: "${RABBITMQ_USER}"
+  RABBITMQ_PASS: "${RABBITMQ_PASS}"
+  RABBITMQ_VHOST: "${RABBITMQ_VHOST:-taiga}"
+  RABBITMQ_HOST: taiga-async-rabbitmq
+
+  ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-True}"
+
+# Volumes compartilhados entre taiga-back e taiga-async
+x-volumes: &default-back-volumes
+  - taiga-static-data:/taiga-back/static
+  - taiga-media-data:/taiga-back/media
+
+
+# =============================================================================
+# SERVIÇOS
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # 🐘 taiga-db — PostgreSQL 15
+  #
+  # Banco de dados relacional principal do Taiga. Armazena todos os dados:
+  # usuários, projetos, tarefas, sprints, permissões e histórico de atividades.
+  # Não exposto ao host — acessível apenas internamente pelos outros serviços.
+  #
+  # Healthcheck garante que o banco esteja pronto antes de subir o back-end.
+  # ---------------------------------------------------------------------------
+  taiga-db:
+    image: postgres:15-alpine
+    container_name: taiga-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB}"
+      POSTGRES_USER: "${POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD}"
+    volumes:
+      - taiga-db-data:/var/lib/postgresql/data
+    networks:
+      - taiga-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  # ---------------------------------------------------------------------------
+  # 🐇 taiga-async-rabbitmq — RabbitMQ 3.12
+  #
+  # Broker de mensagens que conecta o taiga-back ao taiga-async (Celery Worker)
+  # e ao taiga-events (WebSocket). O back-end publica eventos e tarefas nas
+  # filas; o worker e o servidor de eventos as consomem.
+  #
+  # Painel de admin do RabbitMQ disponível em http://IP:15672
+  # (usuário/senha definidos no .env)
+  # ---------------------------------------------------------------------------
+  taiga-async-rabbitmq:
+    image: rabbitmq:3.12-management-alpine
+    container_name: taiga-async-rabbitmq
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: "${RABBITMQ_USER}"
+      RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASS}"
+      RABBITMQ_DEFAULT_VHOST: "${RABBITMQ_VHOST:-taiga}"
+    volumes:
+      - taiga-rabbitmq-data:/var/lib/rabbitmq
+    ports:
+      # Painel web de gerenciamento do RabbitMQ (opcional — remova se não usar)
+      - "15672:15672"
+    networks:
+      - taiga-net
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 20s
+      timeout: 10s
+      retries: 5
+
+
+  # ---------------------------------------------------------------------------
+  # ⚡ taiga-redis — Redis 7
+  #
+  # Cache em memória para respostas da API Django, armazenamento de sessões
+  # de usuários e backend de resultados para as tarefas Celery do taiga-async.
+  # Não exposto ao host — uso interno apenas.
+  # ---------------------------------------------------------------------------
+  taiga-redis:
+    image: redis:7-alpine
+    container_name: taiga-redis
+    restart: unless-stopped
+    volumes:
+      - taiga-redis-data:/data
+    networks:
+      - taiga-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+
+  # ---------------------------------------------------------------------------
+  # 🐍 taiga-back — Django REST API
+  #
+  # Núcleo do sistema. Expõe a API REST do Taiga diretamente na porta 8000
+  # do host. Sem o gateway Nginx, o front-end acessa a API diretamente via
+  # http://IP:8000. Também serve o painel admin em http://IP:8000/admin.
+  #
+  # Na inicialização, aplica migrações pendentes do banco automaticamente.
+  # Depende do banco, RabbitMQ e Redis estarem healthy.
+  # ---------------------------------------------------------------------------
+  taiga-back:
+    image: taigaio/taiga-back:latest
+    container_name: taiga-back
+    restart: unless-stopped
+    environment: *default-back-environment
+    volumes: *default-back-volumes
+    ports:
+      # API REST Django — http://IP:8000/api
+      # Admin Django  — http://IP:8000/admin
+      - "8000:8000"
+    networks:
+      - taiga-net
+    depends_on:
+      taiga-db:
+        condition: service_healthy
+      taiga-async-rabbitmq:
+        condition: service_healthy
+      taiga-redis:
+        condition: service_healthy
+
+
+  # ---------------------------------------------------------------------------
+  # ⚙️  taiga-async — Celery Worker
+  #
+  # Worker assíncrono que consome as filas do RabbitMQ publicadas pelo
+  # taiga-back. Processa tarefas em background sem bloquear a API:
+  #   - Envio de e-mails de convite e notificação
+  #   - Importação de projetos (CSV, Jira, Trello)
+  #   - Execução de webhooks para integrações externas
+  #
+  # Usa a mesma imagem do taiga-back, mas com entrypoint do Celery.
+  # Não expõe nenhuma porta — comunicação via RabbitMQ e Redis apenas.
+  # ---------------------------------------------------------------------------
+  taiga-async:
+    image: taigaio/taiga-back:latest
+    container_name: taiga-async
+    restart: unless-stopped
+    entrypoint: ["/taiga-back/docker/async_entrypoint.sh"]
+    environment: *default-back-environment
+    volumes: *default-back-volumes
+    networks:
+      - taiga-net
+    depends_on:
+      taiga-db:
+        condition: service_healthy
+      taiga-async-rabbitmq:
+        condition: service_healthy
+      taiga-redis:
+        condition: service_healthy
+
+
+  # ---------------------------------------------------------------------------
+  # 🖥️  taiga-front — Interface SPA Angular
+  #
+  # Aplicação Angular servida por um Nginx interno, exposta diretamente na
+  # porta 9000 do host. É a interface gráfica principal do Taiga.
+  #
+  # Para funcionar corretamente sem gateway:
+  #   TAIGA_URL aponta diretamente para o taiga-back (porta 8000)
+  #   TAIGA_WEBSOCKETS_URL aponta para o taiga-events (porta 8888)
+  #
+  # Acesse a interface em: http://IP:9000
+  # ---------------------------------------------------------------------------
+  taiga-front:
+    image: taigaio/taiga-front:latest
+    container_name: taiga-front
+    restart: unless-stopped
+    environment:
+      # URL completa do back-end Django (deve ser acessível pelo navegador do usuário)
+      TAIGA_URL: "${TAIGA_SCHEME}://${TAIGA_DOMAIN}:8000"
+      # Endereço do servidor WebSocket para notificações em tempo real
+      TAIGA_WEBSOCKETS_URL: "ws://${TAIGA_DOMAIN}:8888"
+      TAIGA_SUBPATH: ""
+    ports:
+      # Interface principal do Taiga — http://IP:9000
+      - "9000:80"
+    networks:
+      - taiga-net
+    depends_on:
+      - taiga-back
+
+
+  # ---------------------------------------------------------------------------
+  # 🔔 taiga-events — Servidor WebSocket Node.js
+  #
+  # Recebe eventos publicados pelo taiga-back no RabbitMQ e os transmite
+  # via WebSocket para os navegadores dos usuários conectados.
+  # Isso permite atualizações em tempo real (cards, comentários, status)
+  # sem recarregar a página.
+  #
+  # Exposto diretamente na porta 8888 do host.
+  # O front-end se conecta em ws://IP:8888 para receber notificações.
+  # ---------------------------------------------------------------------------
+  taiga-events:
+    image: taigaio/taiga-events:latest
+    container_name: taiga-events
+    restart: unless-stopped
+    environment:
+      RABBITMQ_USER: "${RABBITMQ_USER}"
+      RABBITMQ_PASS: "${RABBITMQ_PASS}"
+      RABBITMQ_VHOST: "${RABBITMQ_VHOST:-taiga}"
+      RABBITMQ_HOST: taiga-async-rabbitmq
+      SECRET_KEY: "${SECRET_KEY}"
+    ports:
+      # WebSocket — o navegador se conecta nesta porta para notificações ao vivo
+      - "8888:8888"
+    networks:
+      - taiga-net
+    depends_on:
+      taiga-async-rabbitmq:
+        condition: service_healthy
+
+
+  # ---------------------------------------------------------------------------
+  # 🔒 taiga-protected — Controle de Acesso a Arquivos Privados
+  #
+  # Microserviço que valida permissões antes de servir arquivos privados
+  # (anexos, imagens de projetos e tarefas). Garante que somente usuários
+  # autorizados possam baixar os arquivos, mesmo tendo a URL direta.
+  #
+  # Exposto na porta 8003 do host. O front-end solicita arquivos em
+  # http://IP:8003 e este serviço valida o token antes de retornar o conteúdo.
+  # MAX_AGE define por quantos segundos o link de acesso é válido.
+  # ---------------------------------------------------------------------------
+  taiga-protected:
+    image: taigaio/taiga-protected:latest
+    container_name: taiga-protected
+    restart: unless-stopped
+    environment:
+      SECRET_KEY: "${SECRET_KEY}"
+      MAX_AGE: 360
+    ports:
+      # Acesso direto ao serviço de arquivos protegidos
+      - "8003:8003"
+    networks:
+      - taiga-net
+
+
+# =============================================================================
+# VOLUMES NOMEADOS — Persistência de dados entre reinicializações
+#
+# ⚠️  NUNCA execute "docker compose down -v" em dados que importam!
+#     Isso apaga permanentemente todos os volumes abaixo.
+# =============================================================================
+volumes:
+  # Dados completos do PostgreSQL (projetos, usuários, tarefas e histórico)
+  taiga-db-data:
+    driver: local
+
+  # Assets estáticos do Django (CSS, JS, imagens do painel admin)
+  taiga-static-data:
+    driver: local
+
+  # Uploads dos usuários: avatares, imagens de projetos e anexos de tarefas
+  taiga-media-data:
+    driver: local
+
+  # Estado interno do RabbitMQ: filas, exchanges, mensagens pendentes
+  taiga-rabbitmq-data:
+    driver: local
+
+  # Dados persistidos do Redis: cache e resultados das tarefas Celery
+  taiga-redis-data:
+    driver: local
+
+
+# =============================================================================
+# REDE INTERNA
+#
+# Todos os serviços compartilham esta rede bridge isolada.
+# Comunicação interna usa o nome do container como hostname DNS.
+# Somente as portas declaradas em "ports:" ficam acessíveis ao host.
+# =============================================================================
+networks:
+  taiga-net:
+    driver: bridge
