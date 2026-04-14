@@ -1,77 +1,305 @@
 # 🐙 ProjetoTaiga — Stack Docker Completa
 
-> **Taiga** é uma plataforma open-source de gestão de projetos ágeis (Scrum/Kanban).  
-> Este repositório contém a configuração Docker Compose para implantação local ou em produção.
+> **Taiga** é uma plataforma open-source de gestão de projetos ágeis (Scrum/Kanban).
+> Este repositório contém a stack Docker Compose pronta para implantação local ou em servidor.
+>
+> ✅ **Status:** Produção local funcionando em `http://192.168.0.181:9000`
 
 ---
 
 ## 📑 Índice
 
-1. [Visão Geral da Arquitetura](#-visão-geral-da-arquitetura)
-2. [Pré-requisitos](#-pré-requisitos)
-3. [Estrutura do Repositório](#-estrutura-do-repositório)
-4. [Configuração do Ambiente (.env)](#-configuração-do-ambiente-env)
-5. [Passo a Passo — Primeira Execução](#-passo-a-passo--primeira-execução)
-6. [Acessando o Sistema](#-acessando-o-sistema)
-7. [Gerenciamento & Manutenção](#️-gerenciamento--manutenção)
-8. [Persistência de Dados (Volumes)](#-persistência-de-dados-volumes)
-9. [Backup & Restauração](#-backup--restauração)
-10. [Configuração de E-mail (SMTP)](#-configuração-de-e-mail-smtp)
-11. [Produção — Proxy Reverso SSL](#-produção--proxy-reverso-ssl)
-12. [Troubleshooting](#-troubleshooting)
+1. [Como o Taiga Funciona](#-como-o-taiga-funciona)
+2. [Arquitetura da Stack](#️-arquitetura-da-stack)
+3. [Detalhamento de Cada Serviço](#-detalhamento-de-cada-serviço)
+4. [Por Que Cada Variável Existe](#-por-que-cada-variável-existe)
+5. [Pré-requisitos](#-pré-requisitos)
+6. [Estrutura do Repositório](#️-estrutura-do-repositório)
+7. [Passo a Passo — Deploy Completo](#-passo-a-passo--deploy-completo)
+8. [Inicialização Automática (taiga-init)](#-inicialização-automática-taiga-init)
+9. [Gerenciamento & Manutenção](#️-gerenciamento--manutenção)
+10. [Backup & Restauração](#-backup--restauração)
+11. [Troubleshooting — Erros Conhecidos e Soluções](#-troubleshooting--erros-conhecidos-e-soluções)
+12. [Produção — Proxy Reverso SSL](#-produção--proxy-reverso-ssl)
 
 ---
 
-## 🏗️ Visão Geral da Arquitetura
+## 🧠 Como o Taiga Funciona
 
-O Taiga é **modular por design** — cada responsabilidade roda em um container isolado. O fluxo de uma requisição é:
+O Taiga é um sistema **modular** — cada responsabilidade é isolada em um serviço separado. Eles se comunicam entre si, e o usuário final interage com a interface web.
+
+### Fluxo de uma requisição do usuário
 
 ```
-Navegador
-   │
-   ▼
-taiga-gateway (Nginx :9000)  ←── único ponto de entrada
-   │
-   ├──► /             → taiga-front     (SPA Angular)
-   ├──► /api /admin   → taiga-back      (Django REST API)
-   ├──► /events       → taiga-events    (WebSocket Node.js)
-   └──► /-/media/     → taiga-protected (Arquivos privados)
-
-taiga-back ──► taiga-db          (PostgreSQL — dados principais)
-           ──► taiga-redis        (Cache, sessões, filas)
-           ──► taiga-rabbitmq     (Broker de mensagens)
+Usuário no navegador
+       │
+       ▼
+  taiga-front :9000          ← Interface Angular (HTML/CSS/JS estático)
+       │  faz chamadas REST
+       ▼
+  taiga-back :8000            ← API Django (cérebro da aplicação)
+       │
+       ├──► taiga-db          ← Lê/escreve dados (projetos, tarefas, usuários)
+       ├──► taiga-redis       ← Busca em cache (sessões, resultados de queries)
+       └──► taiga-rabbitmq    ← Publica eventos e tarefas na fila
                   │
-                  └──► taiga-async (Celery Worker — tarefas em background)
+                  ├──► taiga-async    ← Consome tarefas (e-mail, webhooks, imports)
+                  └──► taiga-events   ← Consome eventos, envia via WebSocket ao navegador
+                              │
+                              ▼
+                    Navegador recebe atualização em tempo real
+                    (card movido, comentário adicionado, etc.)
 ```
 
-### Tabela de Serviços
+### Fluxo de criar um projeto (exemplo real)
 
-| Container | Imagem | Porta Interna | Função |
-|---|---|---|---|
-| `taiga-gateway` | `nginx:1.25-alpine` | `80` → host:`9000` | Proxy reverso / roteador de entrada |
-| `taiga-front` | `taigaio/taiga-front` | `80` (interno) | Interface web Angular |
-| `taiga-back` | `taigaio/taiga-back` | `8000` (interno) | API REST Django |
-| `taiga-async` | `taigaio/taiga-back` | — | Worker Celery (tarefas assíncronas) |
-| `taiga-events` | `taigaio/taiga-events` | `8888` (interno) | Notificações WebSocket em tempo real |
-| `taiga-protected` | `taigaio/taiga-protected` | `8003` (interno) | Controle de acesso a arquivos privados |
-| `taiga-db` | `postgres:15-alpine` | `5432` (interno) | Banco de dados relacional |
-| `taiga-redis` | `redis:7-alpine` | `6379` (interno) | Cache e gerenciamento de sessões |
-| `taiga-async-rabbitmq` | `rabbitmq:3.12-management-alpine` | `5672` (interno) | Broker de mensagens assíncronas |
+```
+1. Usuário clica em "Novo Projeto" → Angular envia POST /api/v1/projects
+2. taiga-back:
+   a) Valida a requisição e cria o projeto no PostgreSQL
+   b) Aplica o template padrão (colunas, status, permissões)
+   c) Publica evento no RabbitMQ → EVENTS_PUSH_BACKEND_URL
+   d) Publica tarefas async no RabbitMQ → CELERY_BROKER_URL
+3. taiga-events recebe o evento e envia via WebSocket ao navegador
+4. taiga-async processa tarefas em background (e-mails, índices, etc.)
+5. Projeto aparece na tela em tempo real
+```
+
+---
+
+## 🏗️ Arquitetura da Stack
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                        HOST (Servidor)                       │
+│                                                              │
+│  :9000 ──► taiga-front     :8000 ──► taiga-back             │
+│  :8888 ──► taiga-events    :8003 ──► taiga-protected         │
+│  :15672 ──► rabbitmq-admin                                   │
+│                                                              │
+│  ┌─────────────────── rede: taiga-net ──────────────────┐   │
+│  │                                                        │   │
+│  │  taiga-front ──────────────────────► taiga-back       │   │
+│  │  taiga-events ──► taiga-rabbitmq ◄── taiga-back       │   │
+│  │  taiga-async  ──► taiga-rabbitmq                       │   │
+│  │  taiga-back   ──► taiga-db                            │   │
+│  │  taiga-back   ──► taiga-redis                         │   │
+│  │  taiga-async  ──► taiga-db                            │   │
+│  │  taiga-async  ──► taiga-redis                         │   │
+│  │                                                        │   │
+│  └────────────────────────────────────────────────────────┘   │
+│                                                              │
+│  Volumes persistentes:                                       │
+│    taiga-db-data / taiga-media-data / taiga-static-data      │
+│    taiga-rabbitmq-data / taiga-redis-data                    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 📦 Detalhamento de Cada Serviço
+
+### 🖥️ `taiga-front` — Interface Web (porta 9000)
+**Imagem:** `taigaio/taiga-front:latest`
+
+Aplicação Angular compilada e servida por um Nginx interno. É o que o usuário vê no navegador.
+
+- Renderiza o board Kanban, backlog, sprints, épicos e wiki
+- Faz chamadas HTTP para `taiga-back:8000` para buscar e salvar dados
+- Mantém uma conexão WebSocket persistente com `taiga-events:8888` para receber atualizações em tempo real
+- **Não tem lógica de negócio** — é apenas o "rosto" da aplicação
+
+**Variáveis críticas:**
+```env
+TAIGA_URL             → URL do back-end (usada pelo Angular nas chamadas REST)
+TAIGA_WEBSOCKETS_URL  → URL do servidor WebSocket para notificações ao vivo
+```
+
+---
+
+### 🐍 `taiga-back` — API REST Django (porta 8000)
+**Imagem:** `taigaio/taiga-back:latest`
+
+O **cérebro** do Taiga. Toda a lógica de negócio reside aqui.
+
+**Responsabilidades:**
+- Autenticação (login, tokens JWT, OAuth para GitHub/GitLab)
+- CRUD completo de todos os recursos (projetos, epics, stories, tarefas, sprints)
+- Sistema de permissões e papéis por projeto
+- Webhooks e integrações externas
+- Aplicação de migrações de banco na inicialização
+- **Duas conexões independentes ao RabbitMQ** (ver abaixo)
+
+**Por que duas conexões ao RabbitMQ?**
+
+| Conexão | Variável | Finalidade |
+|---|---|---|
+| Celery | `CELERY_BROKER_URL` | Envia tarefas pesadas para o worker processar em background |
+| Events | `EVENTS_PUSH_BACKEND_URL` | Emite eventos em tempo real que o `taiga-events` retransmite via WebSocket |
+
+> ⚠️ **Lição aprendida:** Se `EVENTS_PUSH_BACKEND_URL` não estiver definida, o Django tenta conectar a um host vazio ao salvar qualquer objeto → `socket.gaierror: [Errno -3] Temporary failure in name resolution` → **erro 500 em tudo**.
+
+---
+
+### ⚙️ `taiga-async` — Worker Celery
+**Imagem:** `taigaio/taiga-back:latest` (mesma imagem, entrypoint diferente)
+
+Executa tarefas assíncronas que não devem bloquear a API principal.
+
+**Tarefas processadas:**
+- Envio de e-mails (convites, notificações, reset de senha)
+- Importação de projetos (CSV, Jira, Trello, GitHub)
+- Execução de webhooks para Slack, Teams, etc.
+- Cálculo de estatísticas e relatórios
+
+Consome mensagens da fila do RabbitMQ e usa o Redis para armazenar resultados.
+
+---
+
+### 🔔 `taiga-events` — Servidor WebSocket Node.js (porta 8888)
+**Imagem:** `taigaio/taiga-events:latest`
+
+Ponte entre o RabbitMQ e os navegadores conectados.
+
+**Fluxo:**
+```
+taiga-back salva um objeto
+    → publica evento no RabbitMQ
+        → taiga-events recebe o evento
+            → transmite via WebSocket para todos os usuários
+                que estão visualizando aquele projeto/board
+```
+
+Isso permite que dois usuários no mesmo board vejam as mudanças um do outro **sem recarregar a página**.
+
+---
+
+### 🔒 `taiga-protected` — Controle de Acesso a Arquivos (porta 8003)
+**Imagem:** `taigaio/taiga-protected:latest`
+
+Um microserviço simples que garante que arquivos privados (anexos, imagens de tarefas) só possam ser acessados por usuários autorizados.
+
+**Problema que resolve:** Se os arquivos fossem servidos diretamente pelo Nginx, qualquer pessoa com a URL poderia acessar — mesmo sem estar logada ou sem ter permissão no projeto.
+
+**Fluxo:**
+```
+Navegador → GET /-/media/arquivo-privado
+    → taiga-protected verifica token do usuário
+        → Autorizado: retorna o arquivo (200)
+        → Não autorizado: retorna 403
+```
+
+---
+
+### 🐘 `taiga-db` — PostgreSQL 15
+**Imagem:** `postgres:15-alpine`
+
+Banco de dados principal. Armazena todo o estado da aplicação: usuários, projetos, tarefas, histórico, permissões, configurações.
+
+**Volume:** `taiga-db-data` → `/var/lib/postgresql/data`
+
+---
+
+### ⚡ `taiga-redis` — Redis 7
+**Imagem:** `redis:7-alpine`
+
+Três funções simultâneas:
+1. **Cache** de respostas da API Django (reduz carga no banco)
+2. **Sessões** de usuários autenticados
+3. **Backend de resultados** do Celery (status e resultados de tarefas assíncronas)
+
+**Volume:** `taiga-redis-data` → `/data`
+
+---
+
+### 🐇 `taiga-async-rabbitmq` — RabbitMQ 3.12 (porta 15672 admin)
+**Imagem:** `rabbitmq:3.12-management-alpine`
+
+Broker de mensagens que desacopla os serviços.
+
+**Dois consumidores:**
+- `taiga-async` → consome fila de tarefas Celery
+- `taiga-events` → consome fila de eventos em tempo real
+
+**Painel de administração:** `http://IP:15672` (usuário/senha definidos no `.env`)
+
+**Volume:** `taiga-rabbitmq-data` → `/var/lib/rabbitmq`
+
+---
+
+### 🚀 `taiga-init` — Serviço de Inicialização (roda uma vez)
+**Imagem:** `taigaio/taiga-back:latest` (com script customizado)
+
+Serviço com `restart: "no"` que executa apenas uma vez por `docker compose up`.
+
+**Sequência de execução:**
+```
+[1/4] Aguarda o banco aceitar conexões (loop com retry de 3s)
+[2/4] Aplica migrações pendentes (manage.py migrate)
+[3/4] Coleta arquivos estáticos (manage.py collectstatic)
+[4/4] Cria superusuário admin (verifica se já existe antes)
+```
+
+**Idempotente:** pode rodar múltiplas vezes sem efeitos colaterais.
+
+---
+
+## ⚙️ Por Que Cada Variável Existe
+
+### Variáveis de Identidade
+| Variável | Onde é usada | Por quê |
+|---|---|---|
+| `TAIGA_DOMAIN` | `taiga-front` | URL base que o Angular usa para chamar a API |
+| `TAIGA_SCHEME` | `taiga-back`, `taiga-front` | Define se os links gerados são `http://` ou `https://` |
+| `SECRET_KEY` | `taiga-back`, `taiga-events` | Assina tokens JWT, sessões e valida comunicação entre serviços |
+| `TAIGA_SECRET_KEY` | `taiga-back` | Alias da SECRET_KEY para o settings.py do Django |
+
+### Variáveis de Banco de Dados
+| Variável | Onde é usada | Por quê |
+|---|---|---|
+| `POSTGRES_DB` | `taiga-db`, `taiga-back` | Nome do banco a criar/conectar |
+| `POSTGRES_USER` | `taiga-db`, `taiga-back` | Usuário com acesso ao banco |
+| `POSTGRES_PASSWORD` | `taiga-db`, `taiga-back` | Senha do usuário do banco |
+| `POSTGRES_HOST` | `taiga-back` | Hostname do banco na rede Docker (`taiga-db`) |
+
+### Variáveis de RabbitMQ
+| Variável | Onde é usada | Por quê |
+|---|---|---|
+| `RABBITMQ_USER` | Todos os serviços | Usuário para autenticar no broker |
+| `RABBITMQ_PASS` | Todos os serviços | Senha para autenticar no broker |
+| `RABBITMQ_VHOST` | Todos os serviços | Virtual host isolado para o Taiga |
+| `RABBITMQ_HOST` | `taiga-back`, `taiga-async` | Hostname do broker na rede Docker |
+| `CELERY_BROKER_URL` | `taiga-back`, `taiga-async` | URL completa para o Celery conectar ao broker de tarefas |
+| `EVENTS_PUSH_BACKEND` | `taiga-back` | Classe Python do backend de eventos (rabbitmq) |
+| **`EVENTS_PUSH_BACKEND_URL`** | **`taiga-back`** | **⚠️ URL para emissão de eventos em tempo real — SEM ELA tudo dá 500** |
+
+### Variáveis de Cache
+| Variável | Onde é usada | Por quê |
+|---|---|---|
+| `CELERY_RESULT_BACKEND` | `taiga-async` | Onde o Celery salva resultados de tarefas |
+| `REDIS_URL` | `taiga-back` | URL do Redis para cache e sessões Django |
+
+### Variáveis de E-mail
+| Variável | Valor Local | Valor Produção |
+|---|---|---|
+| `EMAIL_BACKEND` | `console` (imprime nos logs) | `smtp.EmailBackend` |
+| `EMAIL_HOST` | `localhost` | `smtp.suaempresa.com` |
+| `EMAIL_PORT` | `587` | `587` |
+| `EMAIL_HOST_USER` | _(vazio)_ | `usuario@empresa.com` |
+| `EMAIL_HOST_PASSWORD` | _(vazio)_ | senha SMTP |
+| `EMAIL_USE_TLS` | `False` | `True` |
 
 ---
 
 ## ✅ Pré-requisitos
 
-Certifique-se de que os seguintes softwares estão instalados e funcionando:
-
-| Software | Versão mínima | Verificação |
+| Software | Versão mínima | Como verificar |
 |---|---|---|
 | Docker Engine | 24.x | `docker --version` |
 | Docker Compose Plugin | 2.x | `docker compose version` |
 | Git | qualquer | `git --version` |
 
-> **Windows:** Use Docker Desktop com WSL2 habilitado.  
-> **Linux:** Instale via `apt install docker.io docker-compose-plugin` ou script oficial do Docker.
+> **Windows:** Docker Desktop com WSL2. **Linux/macOS:** Docker Engine nativo.
 
 ---
 
@@ -81,404 +309,303 @@ Certifique-se de que os seguintes softwares estão instalados e funcionando:
 ProjetoTaiga/
 │
 ├── docker-compose.yml       # Orquestração de todos os serviços
-├── .env.example             # Template de variáveis de ambiente (versionar ✅)
+├── .env.example             # Template de variáveis (versionar ✅)
 ├── .env                     # Variáveis reais com senhas (NÃO versionar ❌)
-├── .gitignore               # Ignora o .env e logs
+├── .gitignore               # Ignora .env e logs
 ├── README.md                # Esta documentação
 │
+├── scripts/
+│   └── init.sh              # Script de inicialização automática
+│
 └── nginx/
-    └── taiga.conf           # Configuração do gateway Nginx (roteamento)
+    └── taiga.conf           # Config Nginx (referência — não usada no modo local)
 ```
 
 ---
 
-## ⚙️ Configuração do Ambiente (.env)
+## 🚀 Passo a Passo — Deploy Completo
 
-Todas as configurações sensíveis ficam centralizadas no arquivo `.env`.
-
-### Como criar
+### 1. Clonar o repositório
 
 ```bash
-cp .env.example .env
-```
-
-Edite o `.env` com seu editor de preferência:
-
-```bash
-# Linux / macOS
-nano .env
-
-# Windows (VS Code)
-code .env
-```
-
-### Variáveis Obrigatórias
-
-| Variável | Descrição | Exemplo |
-|---|---|---|
-| `TAIGA_DOMAIN` | IP ou domínio de acesso ao Taiga | `192.168.1.10:9000` ou `taiga.empresa.com` |
-| `TAIGA_SCHEME` | Protocolo HTTP ou HTTPS | `http` (local) / `https` (produção) |
-| `SECRET_KEY` | Chave criptográfica da aplicação (mínimo 64 chars aleatórios) | `abc123...xyz` |
-| `POSTGRES_DB` | Nome do banco de dados | `taiga` |
-| `POSTGRES_USER` | Usuário do banco de dados | `taiga` |
-| `POSTGRES_PASSWORD` | Senha do banco de dados | `SenhaForte@2024!` |
-| `RABBITMQ_USER` | Usuário do broker de mensagens | `taiga` |
-| `RABBITMQ_PASS` | Senha do broker de mensagens | `RabbitSenha@Forte!` |
-| `RABBITMQ_VHOST` | Virtual host do RabbitMQ | `taiga` |
-
-### Gerando uma SECRET_KEY segura
-
-```bash
-# Com Python
-python -c "import secrets; print(secrets.token_hex(64))"
-
-# Com OpenSSL
-openssl rand -hex 64
-```
-
-### Variáveis de E-mail (Opcionais para testes)
-
-| Variável | Padrão | Descrição |
-|---|---|---|
-| `EMAIL_BACKEND` | `console` (exibe no log) | Trocar para `smtp.EmailBackend` em produção |
-| `EMAIL_HOST` | — | Servidor SMTP (ex: `smtp.gmail.com`) |
-| `EMAIL_PORT` | `587` | Porta SMTP |
-| `EMAIL_HOST_USER` | — | Usuário SMTP |
-| `EMAIL_HOST_PASSWORD` | — | Senha SMTP |
-| `EMAIL_USE_TLS` | `True` | Ativa TLS |
-| `DEFAULT_FROM_EMAIL` | — | Remetente padrão dos e-mails |
-
----
-
-## 🚀 Passo a Passo — Primeira Execução
-
-### Passo 1 — Clonar o repositório (se necessário)
-
-```bash
-git clone https://github.com/SEU_USUARIO/ProjetoTaiga.git
+git clone https://github.com/yurythx/ProjetoTaiga.git
 cd ProjetoTaiga
 ```
 
-### Passo 2 — Configurar as variáveis de ambiente
+### 2. Criar e configurar o `.env`
 
 ```bash
 cp .env.example .env
-# Edite o .env com suas senhas e domínio
+nano .env   # ou: code .env
 ```
 
-### Passo 3 — Subir os containers
+**Campos obrigatórios:**
+
+```env
+TAIGA_DOMAIN=192.168.0.X          # IP da sua máquina (ipconfig / ip addr)
+SECRET_KEY=CHAVE_LONGA_ALEATÓRIA  # Gere com o comando abaixo
+POSTGRES_PASSWORD=SenhaForte!
+RABBITMQ_PASS=SenhaForte!
+DJANGO_SUPERUSER_USERNAME=admin
+DJANGO_SUPERUSER_EMAIL=admin@local.com
+DJANGO_SUPERUSER_PASSWORD=SenhaAdmin!
+```
+
+**Gerar SECRET_KEY:**
+```bash
+python3 -c "import secrets; print(secrets.token_hex(64))"
+# ou
+openssl rand -hex 64
+```
+
+### 3. Subir a stack
 
 ```bash
 docker compose up -d
 ```
 
-> ⏳ **Na primeira vez**, o Docker baixará ~1 GB em imagens. Pode levar alguns minutos.
+> ⏳ **Primeira execução:** baixa ~1-2 GB de imagens. Pode levar alguns minutos.
 
-Acompanhe os logs durante a inicialização:
+### 4. Acompanhar a inicialização automática
 
 ```bash
-docker compose logs -f
+docker compose logs -f taiga-init
 ```
 
-Aguarde todos os serviços aparecerem como `healthy`:
+Aguarde a mensagem:
+```
+✅ Inicialização concluída com sucesso!
+```
+
+### 5. Verificar todos os serviços
 
 ```bash
 docker compose ps
 ```
 
-Saída esperada:
+Todos devem aparecer como `running` ou `healthy`.
 
-```
-NAME                     STATUS
-taiga-db                 healthy
-taiga-async-rabbitmq     healthy
-taiga-redis              healthy
-taiga-back               running
-taiga-async              running
-taiga-front              running
-taiga-events             running
-taiga-protected          running
-taiga-gateway            running
-```
+### 6. Acessar o Taiga
 
-### Passo 4 — Criar o usuário administrador
+| URL | O quê |
+|---|---|
+| `http://SEU_IP:9000` | Interface principal |
+| `http://SEU_IP:8000/admin` | Admin Django |
+| `http://SEU_IP:15672` | Admin RabbitMQ |
 
-```bash
-docker compose exec taiga-back python manage.py createsuperuser
-```
-
-Siga as instruções no terminal:
-- **Username:** nome de usuário para login
-- **Email:** e-mail do administrador
-- **Password:** senha (mínimo 8 caracteres)
-
-### Passo 5 — Aplicar migrações (apenas se necessário)
-
-Na maioria dos casos, as migrações já rodam automaticamente. Se houver erros:
-
-```bash
-docker compose exec taiga-back python manage.py migrate
-```
+**Login:** usuário e senha definidos em `DJANGO_SUPERUSER_*` no `.env`.
 
 ---
 
-## 🌐 Acessando o Sistema
+## 🤖 Inicialização Automática (`taiga-init`)
 
-Após todos os containers estarem `running`, acesse:
+O serviço `taiga-init` é executado automaticamente a cada `docker compose up` e:
 
-| URL | Descrição |
-|---|---|
-| `http://localhost:9000` | Interface principal do Taiga |
-| `http://localhost:9000/admin` | Painel de administração Django |
-| `http://localhost:15672` | Painel de gerenciamento do RabbitMQ (se exposto) |
+1. **Aguarda o banco** estar pronto (loop com retry a cada 3s)
+2. **Aplica migrações** → `manage.py migrate --noinput`
+3. **Coleta estáticos** → `manage.py collectstatic --noinput --clear`
+4. **Cria o superusuário** → só cria se ainda não existir
 
-> Em produção, substitua `localhost:9000` pelo seu domínio configurado em `TAIGA_DOMAIN`.
+```bash
+# Ver o que o taiga-init executou
+docker compose logs taiga-init
+```
+
+**Seguro para re-execuções:** não duplica dados nem gera erros se já existirem.
 
 ---
 
 ## 🛠️ Gerenciamento & Manutenção
 
-### Comandos Essenciais
+### Comandos do dia a dia
 
 | Ação | Comando |
 |---|---|
-| Verificar status dos serviços | `docker compose ps` |
-| Ver logs em tempo real (todos) | `docker compose logs -f` |
-| Ver logs de um serviço específico | `docker compose logs -f taiga-back` |
-| Reiniciar um serviço específico | `docker compose restart taiga-back` |
-| Parar todos os serviços | `docker compose stop` |
-| Iniciar serviços parados | `docker compose start` |
-| Parar e remover containers | `docker compose down` |
-| Recriar containers após mudança no `.env` | `docker compose up -d` |
-| Forçar recriação de todos os containers | `docker compose up -d --force-recreate` |
-| Atualizar imagens para latest | `docker compose pull && docker compose up -d` |
+| Ver status | `docker compose ps` |
+| Logs em tempo real (todos) | `docker compose logs -f` |
+| Logs de um serviço | `docker compose logs -f taiga-back` |
+| Reiniciar um serviço | `docker compose restart taiga-back` |
+| Parar tudo | `docker compose stop` |
+| Iniciar parado | `docker compose start` |
+| Recriar após mudança no `.env` | `docker compose up -d --force-recreate taiga-back taiga-async` |
+| Atualizar imagens | `docker compose pull && docker compose up -d` |
 
-> ⚠️ **NUNCA use** `docker compose down -v` em produção — isso apaga todos os dados!
-
-### Executar comandos Django no container
+### Comandos Django úteis
 
 ```bash
-# Criar superusuário
-docker compose exec taiga-back python manage.py createsuperuser
-
-# Aplicar migrações pendentes
+# Aplicar migrações manualmente
 docker compose exec taiga-back python manage.py migrate
 
-# Coletar arquivos estáticos
-docker compose exec taiga-back python manage.py collectstatic --noinput
+# Criar superusuário interativo
+docker compose exec taiga-back python manage.py createsuperuser
 
-# Alterar senha de um usuário
-docker compose exec taiga-back python manage.py changepassword <username>
+# Alterar senha de usuário
+docker compose exec taiga-back python manage.py changepassword admin
 
-# Abrir shell interativo Django
+# Shell interativo Django
 docker compose exec taiga-back python manage.py shell
 
-# Abrir bash no container
+# Bash dentro do container
 docker compose exec taiga-back bash
 ```
 
 ---
 
-## 💾 Persistência de Dados (Volumes)
+## 💾 Backup & Restauração
 
-Todos os dados importantes são armazenados em volumes Docker nomeados, que sobrevivem a `docker compose down`.
-
-| Volume | Ponto de Montagem | Conteúdo |
-|---|---|---|
-| `taiga-db-data` | `/var/lib/postgresql/data` | Banco de dados PostgreSQL completo |
-| `taiga-media-data` | `/taiga-back/media` | Uploads: avatares, anexos, imagens de projetos |
-| `taiga-static-data` | `/taiga-back/static` | Assets estáticos da API Django |
-| `taiga-rabbitmq-data` | `/var/lib/rabbitmq` | Estado e filas do RabbitMQ |
-| `taiga-redis-data` | `/data` | Dados persistidos do Redis |
+### Backup do banco de dados
 
 ```bash
-# Listar volumes do Taiga
-docker volume ls | grep taiga
-
-# Inspecionar um volume
-docker volume inspect projetotaiga_taiga-db-data
-```
-
----
-
-## 🗄️ Backup & Restauração
-
-### Backup do Banco de Dados
-
-```bash
-# Exportar dump SQL
-docker compose exec taiga-db pg_dump -U ${POSTGRES_USER} ${POSTGRES_DB} \
+docker compose exec taiga-db pg_dump -U taiga taiga \
   > backup_taiga_$(date +%Y%m%d_%H%M%S).sql
 ```
 
-### Restaurar o Banco de Dados
+### Restaurar banco de dados
 
 ```bash
-# Restaurar a partir de um dump
-cat backup_taiga_YYYYMMDD.sql | docker compose exec -T taiga-db \
-  psql -U ${POSTGRES_USER} ${POSTGRES_DB}
+cat backup_taiga_YYYYMMDD.sql | \
+  docker compose exec -T taiga-db psql -U taiga taiga
 ```
 
-### Backup dos Arquivos de Mídia
-
-```bash
-# Compactar volume de mídia em tar.gz
-docker run --rm \
-  -v projetotaiga_taiga-media-data:/data \
-  -v $(pwd):/backup \
-  alpine tar czf /backup/media_backup_$(date +%Y%m%d).tar.gz /data
-```
-
-### Restaurar Mídias
+### Backup dos arquivos de mídia (uploads)
 
 ```bash
 docker run --rm \
   -v projetotaiga_taiga-media-data:/data \
   -v $(pwd):/backup \
-  alpine tar xzf /backup/media_backup_YYYYMMDD.tar.gz -C /
+  alpine tar czf /backup/media_$(date +%Y%m%d).tar.gz /data
 ```
 
----
-
-## 📧 Configuração de E-mail (SMTP)
-
-Para que o Taiga envie e-mails de convite, notificação e recuperação de senha, configure o SMTP no `.env`:
-
-```env
-EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
-DEFAULT_FROM_EMAIL=no-reply@suaempresa.com
-EMAIL_HOST=smtp.suaempresa.com
-EMAIL_PORT=587
-EMAIL_HOST_USER=usuario@suaempresa.com
-EMAIL_HOST_PASSWORD=SUA_SENHA_SMTP
-EMAIL_USE_TLS=True
-EMAIL_USE_SSL=False
-```
-
-Após editar, reinicie apenas os serviços que usam e-mail:
+### Restaurar mídia
 
 ```bash
-docker compose up -d taiga-back taiga-async
-```
-
-#### Exemplos por provedor
-
-| Provedor | HOST | PORT | TLS |
-|---|---|---|---|
-| Gmail | `smtp.gmail.com` | `587` | `True` |
-| Outlook/Office365 | `smtp.office365.com` | `587` | `True` |
-| Amazon SES | `email-smtp.us-east-1.amazonaws.com` | `587` | `True` |
-| Mailgun | `smtp.mailgun.org` | `587` | `True` |
-
-> ⚠️ **Gmail:** Você precisa de uma "Senha de app", não a senha normal da conta.
-
----
-
-## 🔒 Produção — Proxy Reverso SSL
-
-Em produção, **nunca deixe o Taiga exposto na porta 9000 diretamente**. Coloque um proxy reverso com SSL na frente.
-
-### Opção 1 — Nginx externo (manual)
-
-Instale o Nginx no servidor host e configure um virtual host apontando para `localhost:9000`.
-
-### Opção 2 — Traefik (recomendado para Docker)
-
-Adicione ao `docker-compose.yml`:
-
-```yaml
-  traefik:
-    image: traefik:v3.0
-    command:
-      - "--providers.docker=true"
-      - "--entrypoints.web.address=:80"
-      - "--entrypoints.websecure.address=:443"
-      - "--certificatesresolvers.le.acme.httpchallenge=true"
-      - "--certificatesresolvers.le.acme.email=seu@email.com"
-      - "--certificatesresolvers.le.acme.storage=/acme.json"
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      - ./acme.json:/acme.json
-    networks:
-      - taiga-net
-```
-
-E adicione labels ao `taiga-gateway`:
-
-```yaml
-  taiga-gateway:
-    labels:
-      - "traefik.enable=true"
-      - "traefik.http.routers.taiga.rule=Host(`taiga.seudominio.com`)"
-      - "traefik.http.routers.taiga.entrypoints=websecure"
-      - "traefik.http.routers.taiga.tls.certresolver=le"
-```
-
-Ajuste também o `.env`:
-
-```env
-TAIGA_DOMAIN=taiga.seudominio.com
-TAIGA_SCHEME=https
+docker run --rm \
+  -v projetotaiga_taiga-media-data:/data \
+  -v $(pwd):/backup \
+  alpine tar xzf /backup/media_YYYYMMDD.tar.gz -C /
 ```
 
 ---
 
-## 🐛 Troubleshooting
+## 🐛 Troubleshooting — Erros Conhecidos e Soluções
 
-### Container `taiga-back` reinicia em loop
+### ❌ ERR_CONNECTION_REFUSED na porta 8000 ou 9000
+**Causa:** `.env` não existe ou está vazio — containers não sobem sem variáveis.
 
+```bash
+# Verificar se o .env existe
+ls -la .env
+
+# Verificar se os containers estão rodando
+docker compose ps
+
+# Solução
+cp .env.example .env
+# preencher o .env
+docker compose up -d
+```
+
+---
+
+### ❌ 500 Internal Server Error ao criar projetos
+**Causa:** `EVENTS_PUSH_BACKEND_URL` não definida.
+
+O `taiga-back` usa **duas conexões separadas** ao RabbitMQ:
+- `CELERY_BROKER_URL` → tarefas assíncronas (Celery)
+- `EVENTS_PUSH_BACKEND_URL` → eventos em tempo real
+
+Sem a segunda, ao salvar **qualquer objeto** no banco, o Django tenta emitir um evento para um host vazio → DNS falha → 500.
+
+```bash
+# Verificar nos logs
+docker compose logs taiga-back | grep "gaierror\|name resolution"
+
+# Solução: garantir no .env estas variáveis
+EVENTS_PUSH_BACKEND=taiga.events.backends.rabbitmq.EventsPushBackend
+EVENTS_PUSH_BACKEND_URL=amqp://USER:PASS@taiga-async-rabbitmq/taiga
+```
+
+---
+
+### ❌ 404 em `/api/v1/user-storage/...` (console do browser)
+**Comportamento NORMAL — não é um erro.**
+
+O Angular busca preferências de UI do usuário ao carregar a tela. Se o usuário nunca salvou aquela preferência, a API retorna 404. O front-end usa os valores padrão e cria a preferência quando necessário. Desaparece conforme se usa o sistema.
+
+---
+
+### ❌ Container `taiga-back` em loop de reinicialização
 ```bash
 docker compose logs taiga-back
 ```
 
-**Causa comum:** banco de dados ainda não está pronto.  
-**Solução:** aguarde o `taiga-db` obter status `healthy` e tente novamente.
+**Causas comuns:**
+- `taiga-db` ainda não está `healthy` (aguardar)
+- Variáveis do banco incorretas no `.env`
+- `SECRET_KEY` vazia
 
-### Erro de conexão ao banco de dados
+---
 
-```bash
-docker compose exec taiga-db pg_isready -U taiga
-```
-
-Se retornar "não está aceitando conexões", revise as variáveis `POSTGRES_*` no `.env`.
-
-### Página em branco ou erro 502
-
-```bash
-docker compose logs taiga-gateway
-docker compose logs taiga-front
-```
-
-Verifique se o `taiga-front` subiu corretamente.
-
-### WebSocket não conecta (notificações não funcionam)
+### ❌ Notificações em tempo real não funcionam (sem WebSocket)
+**Causa:** `taiga-events` não conecta ao RabbitMQ.
 
 ```bash
 docker compose logs taiga-events
+# Verificar se RABBITMQ_USER e RABBITMQ_PASS estão corretos
+# Verificar se taiga-async-rabbitmq está healthy
+docker compose ps taiga-async-rabbitmq
 ```
 
-Verifique se `RABBITMQ_USER` e `RABBITMQ_PASS` estão corretos e se o `taiga-async-rabbitmq` está `healthy`.
+---
 
-### Resetar TUDO (dados inclusos) ⚠️
-
+### ❌ Resetar TUDO (incluindo dados)
 ```bash
-# Cuidado: apaga todos os dados!
+# ⚠️ APAGA TODOS OS DADOS — use apenas em ambiente de teste!
 docker compose down -v
 docker compose up -d
 ```
 
 ---
 
+## 🔒 Produção — Proxy Reverso SSL
+
+Em produção, coloque um proxy reverso com SSL na frente. O `taiga-gateway` expõe a porta 9000.
+
+### Nginx Externo (exemplo)
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name taiga.suaempresa.com;
+
+    ssl_certificate     /etc/letsencrypt/live/taiga.suaempresa.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/taiga.suaempresa.com/privkey.pem;
+
+    location / {
+        proxy_pass http://localhost:9000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+}
+```
+
+**Atualize o `.env`:**
+```env
+TAIGA_DOMAIN=taiga.suaempresa.com
+TAIGA_SCHEME=https
+```
+
+---
+
 ## 📌 Referências
 
-- [Documentação oficial do Taiga](https://community.taiga.io/t/taiga-30min-setup/170)
 - [Repositório oficial taiga-docker](https://github.com/taigaio/taiga-docker)
+- [Documentação oficial Taiga](https://community.taiga.io/t/taiga-30min-setup/170)
 - [Taiga no Docker Hub](https://hub.docker.com/u/taigaio)
 - [Fórum da comunidade Taiga](https://community.taiga.io/)
 
 ---
 
-> Mantido por **ProjetoTaiga** | Configuração Docker Compose — versão `2025`
+> **ProjetoTaiga** | Stack Docker — Implantado e validado em produção local `192.168.0.181`
+> Versão: `2025` | Maintainer: DTI
