@@ -56,6 +56,12 @@ x-environment: &default-back-environment
 
   ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-True}"
 
+  # Credenciais do superusuário criado automaticamente na primeira inicialização
+  # Lidas pelo script scripts/init.sh via serviço taiga-init
+  DJANGO_SUPERUSER_USERNAME: "${DJANGO_SUPERUSER_USERNAME}"
+  DJANGO_SUPERUSER_EMAIL: "${DJANGO_SUPERUSER_EMAIL}"
+  DJANGO_SUPERUSER_PASSWORD: "${DJANGO_SUPERUSER_PASSWORD}"
+
 # Volumes compartilhados entre taiga-back e taiga-async
 x-volumes: &default-back-volumes
   - taiga-static-data:/taiga-back/static
@@ -209,6 +215,45 @@ services:
       taiga-redis:
         condition: service_healthy
 
+
+  # ---------------------------------------------------------------------------
+  # 🚀 taiga-init — Inicialização Automática (roda uma vez e encerra)
+  #
+  # Serviço de lifecycle que executa o script scripts/init.sh na primeira
+  # (e demais) inicializações da stack. Com "restart: no", roda apenas uma
+  # vez por "docker compose up" e encerra após concluir.
+  #
+  # Responsabilidades (em ordem):
+  #   1. Aguarda o banco de dados aceitar conexões
+  #   2. Aplica todas as migrações Django pendentes (manage.py migrate)
+  #   3. Coleta arquivos estáticos (manage.py collectstatic)
+  #   4. Cria o superusuário se ainda não existir (seguro p/ re-execuções)
+  #
+  # Credenciais definidas no .env:
+  #   DJANGO_SUPERUSER_USERNAME, DJANGO_SUPERUSER_EMAIL, DJANGO_SUPERUSER_PASSWORD
+  # ---------------------------------------------------------------------------
+  taiga-init:
+    image: taigaio/taiga-back:latest
+    container_name: taiga-init
+    # Roda uma única vez — não reinicia automaticamente
+    restart: "no"
+    # Monta o script de inicialização dentro do container
+    entrypoint: ["/bin/sh", "/scripts/init.sh"]
+    environment: *default-back-environment
+    volumes:
+      - taiga-static-data:/taiga-back/static
+      - taiga-media-data:/taiga-back/media
+      # Script de inicialização montado como somente-leitura
+      - ./scripts/init.sh:/scripts/init.sh:ro
+    networks:
+      - taiga-net
+    depends_on:
+      taiga-db:
+        condition: service_healthy
+      taiga-async-rabbitmq:
+        condition: service_healthy
+      taiga-redis:
+        condition: service_healthy
 
   # ---------------------------------------------------------------------------
   # 🖥️  taiga-front — Interface SPA Angular
