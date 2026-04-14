@@ -1,4 +1,4 @@
-version: "3.9"
+# version removida — obsoleta no Docker Compose v2+
 
 # =============================================================================
 #  TAIGA — Docker Compose (Modo Local / Sem Proxy Reverso)
@@ -55,6 +55,17 @@ x-environment: &default-back-environment
   RABBITMQ_HOST: taiga-async-rabbitmq
 
   ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-True}"
+
+  # SECRET_KEY também diretamente (consumida por alguns módulos do taiga-back e pelo taiga-events)
+  SECRET_KEY: "${SECRET_KEY}"
+
+  # URL do broker Celery — necessária para o taiga-async processar tasks de criação de projeto,
+  # importação, webhooks e envio de e-mails em background
+  CELERY_BROKER_URL: "amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@taiga-async-rabbitmq/${RABBITMQ_VHOST:-taiga}"
+  CELERY_RESULT_BACKEND: "redis://taiga-redis:6379/0"
+
+  # URL do Redis para cache e sessões
+  REDIS_URL: "redis://taiga-redis:6379/0"
 
   # Credenciais do superusuário criado automaticamente na primeira inicialização
   # Lidas pelo script scripts/init.sh via serviço taiga-init
