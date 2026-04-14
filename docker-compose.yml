@@ -67,6 +67,12 @@ x-environment: &default-back-environment
   # URL do Redis para cache e sessões
   REDIS_URL: "redis://taiga-redis:6379/0"
 
+  # ⚠️  CRÍTICO: backend de eventos em tempo real (WebSocket via RabbitMQ)
+  # Sem essas duas variáveis, o taiga-back falha ao emitir eventos ao criar
+  # projetos, tarefas e qualquer objeto — causando erro 500 (DNS resolution fail)
+  EVENTS_PUSH_BACKEND: "taiga.events.backends.rabbitmq.EventsPushBackend"
+  EVENTS_PUSH_BACKEND_URL: "amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@taiga-async-rabbitmq/${RABBITMQ_VHOST:-taiga}"
+
   # Credenciais do superusuário criado automaticamente na primeira inicialização
   # Lidas pelo script scripts/init.sh via serviço taiga-init
   DJANGO_SUPERUSER_USERNAME: "${DJANGO_SUPERUSER_USERNAME}"
